@@ -1,0 +1,16 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# Never commit terraform.tfvars — it contains secrets.
+
+aws_region = "us-east-1"
+
+# Run: aws sts get-caller-identity --query Account --output text
+
+account_id = "123456789012"
+
+# Find your IP at https://checkip.amazonaws.com, then append /32
+
+your_ip = "1.2.3.4/32"
+
+# Choose a strong password for RDS PostgreSQL
+
+db_password = "changeme"

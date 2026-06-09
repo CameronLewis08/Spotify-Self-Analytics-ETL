@@ -5,15 +5,34 @@ terraform {
       version = "~> 5.0"
     }
   }
-  # TODO: after your first `terraform apply`, add an S3 backend here so state is
-  # stored remotely instead of in the local terraform.tfstate file.
+  # TODO: after your S3 bucket exists, uncomment this backend block and fill in:
+  #   bucket = "spotify-etl-raw-<your-account-id>"
+  #   key    = "terraform/state"
+  # Then run `terraform init -migrate-state` to move local state to S3.
   # Docs: https://developer.hashicorp.com/terraform/language/backend/s3
+  #
+  # backend "s3" {
+  #   bucket = ""
+  #   key    = "terraform/state"
+  #   region = "us-east-1"
+  # }
+  required_version = ">= 1.0"
 }
 
 provider "aws" {
   region = var.aws_region
+  # Uses your default AWS credentials from `aws configure`.
   # Terraform will use your local AWS credentials (from `aws configure`) or the
   # EC2 instance role if running on EC2.
+}
+
+resource "aws_budgets_budget" "My_Budget" {
+    name = "monthly-budget"
+    budget_type = "COST"
+    limit_amount = "50"
+    limit_unit = "USD"
+    time_unit = "MONTHLY"
+    time_period_start = "2026-06-09_00:01"
 }
 
 # TODO: fill in each module block after you've created the corresponding module directory.
