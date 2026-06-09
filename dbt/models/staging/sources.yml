@@ -1,0 +1,12 @@
+version: 2
+
+sources:
+  - name: spotify_raw
+    database: spotify_analytics
+    schema: public
+    tables:
+      - name: raw_saved_tracks
+      - name: raw_saved_albums
+      - name: raw_playlists
+      - name: raw_playlist_tracks
+      - name: raw_artists
