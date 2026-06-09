@@ -1,647 +1,379 @@
-# PRD — Spotify Self-Analytics ETL
+# PRD — Spotify Self-Analytics ETL Pipeline
 
-## Goal
-
-Build a production-style ETL pipeline on AWS that extracts personal music data from the Spotify Web API, lands raw JSON to S3, loads structured data into RDS PostgreSQL, models it with dbt Core, and orchestrates everything with Apache Airflow — producing four analyst-ready mart tables about personal listening habits.
-
----
-
-## Architecture
-
-```
-Spotify API
-    │
-    ▼ (Python + Spotipy, OAuth 2.0)
-Amazon S3  ← raw JSON landing layer
-    │
-    ▼ (Python loaders)
-RDS PostgreSQL  ← structured tables
-    │
-    ▼ (dbt Core, BashOperator)
-dbt Staging → Intermediate → Marts
-    │
-    ▼
-mart_artist_loyalty
-mart_genre_breakdown
-mart_save_velocity
-mart_playlist_composition
-```
-
-**Orchestration:** Two Airflow DAGs on EC2  
-**Infrastructure:** Provisioned with Terraform  
-**Alerting:** Slack webhook on DAG failure  
+> **Status:** Ready for implementation  
+> **Publish to:** GitHub Issues with `needs-triage` label once remote is configured
 
 ---
 
-## Infrastructure (Terraform)
+## Problem Statement
 
-### Resources to provision
+A data engineer building a portfolio cannot demonstrate end-to-end pipeline skills from a
+description alone. Interviewers need to see working evidence of: OAuth API extraction,
+a raw landing layer, idempotent loading into a relational database, SQL transformation
+with a modeling framework, and workflow orchestration with failure alerting — all on
+cloud infrastructure provisioned as code.
 
-| Resource | Config |
-|----------|--------|
-| VPC | Single VPC with public + private subnets |
-| EC2 | `t3.medium`, Amazon Linux 2, Docker + Docker Compose |
-| RDS | `db.t3.micro` PostgreSQL 15, private subnet, no public access |
-| S3 | One bucket: `spotify-analytics-{account-id}`, versioning enabled |
-| IAM | EC2 instance role with S3 read/write + RDS connect permissions |
-| Security Groups | EC2: SSH (your IP only) + outbound all; RDS: port 5432 from EC2 SG only |
-
-### File structure
-
-```
-terraform/
-├── main.tf          # provider, backend
-├── variables.tf     # region, account_id, your_ip, db_password
-├── outputs.tf       # ec2_public_ip, rds_endpoint, s3_bucket_name
-└── modules/
-    ├── networking/  # VPC, subnets, IGW, route tables
-    ├── compute/     # EC2, security group, key pair
-    ├── database/    # RDS, subnet group, security group
-    ├── storage/     # S3 bucket, bucket policy
-    └── iam/         # instance role, policy, instance profile
-```
-
-### Scaffolding
-
-```hcl
-# terraform/main.tf
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
-  # TODO: Add S3 backend after bucket is provisioned
-}
-
-provider "aws" {
-  region = var.aws_region
-}
-
-module "networking" {
-  source = "./modules/networking"
-}
-
-module "storage" {
-  source     = "./modules/storage"
-  account_id = var.account_id
-}
-
-module "iam" {
-  source          = "./modules/iam"
-  s3_bucket_arn   = module.storage.bucket_arn
-}
-
-module "database" {
-  source            = "./modules/database"
-  vpc_id            = module.networking.vpc_id
-  private_subnet_ids = module.networking.private_subnet_ids
-  ec2_sg_id         = module.compute.ec2_sg_id
-  db_password       = var.db_password
-}
-
-module "compute" {
-  source              = "./modules/compute"
-  vpc_id              = module.networking.vpc_id
-  public_subnet_id    = module.networking.public_subnet_id
-  your_ip             = var.your_ip
-  instance_profile    = module.iam.instance_profile_name
-}
-```
+Without a project that wires all of these together on real data, a candidate cannot
+credibly discuss the architectural decisions, failure modes, or operational concerns
+that distinguish a junior data engineer from someone who has only done coursework.
 
 ---
 
-## Extraction Layer
+## Solution
 
-### Spotify OAuth flow
+A production-style ETL pipeline that extracts personal music data from the Spotify Web API
+on a daily schedule, lands raw JSON to Amazon S3, loads structured records into RDS
+PostgreSQL, models the data through staging → intermediate → mart layers using dbt Core,
+and orchestrates every step with Apache Airflow — deployed on AWS and provisioned entirely
+with Terraform.
 
-Use the **Authorization Code Flow** (not Client Credentials) to access personal saved library data. Tokens must be refreshed automatically.
-
-```python
-# extraction/spotify_client.py
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-
-SCOPES = [
-    "user-library-read",
-    "playlist-read-private",
-    "playlist-read-collaborative",
-]
-
-def get_spotify_client() -> spotipy.Spotify:
-    return spotipy.Spotify(
-        auth_manager=SpotifyOAuth(
-            client_id=...,       # from env / AWS SSM Parameter Store
-            client_secret=...,   # from env / AWS SSM Parameter Store
-            redirect_uri=...,
-            scope=" ".join(SCOPES),
-            cache_path="/opt/airflow/.spotify_cache",
-        )
-    )
-```
-
-### Extractor interface
-
-Each extractor follows the same contract: fetch from API, return raw dict.
-
-```python
-# extraction/extractors/base.py
-from abc import ABC, abstractmethod
-from typing import Any
-
-class BaseExtractor(ABC):
-    def __init__(self, client):
-        self.client = client
-
-    @abstractmethod
-    def extract(self, **kwargs) -> dict[str, Any]:
-        """Return raw API response as a dict."""
-        ...
-```
-
-### Saved tracks (watermark incremental)
-
-```python
-# extraction/extractors/saved_tracks.py
-from datetime import datetime
-from .base import BaseExtractor
-
-class SavedTracksExtractor(BaseExtractor):
-    def extract(self, after: datetime | None = None) -> dict:
-        results = {"items": [], "extracted_at": datetime.utcnow().isoformat()}
-        offset = 0
-        limit = 50
-
-        while True:
-            batch = self.client.current_user_saved_tracks(limit=limit, offset=offset)
-            items = batch["items"]
-
-            if after:
-                items = [i for i in items if i["added_at"] > after.isoformat()]
-                if len(items) < limit:
-                    results["items"].extend(items)
-                    break
-
-            results["items"].extend(items)
-            if not batch["next"]:
-                break
-            offset += limit
-
-        return results
-```
-
-### Playlists (full refresh)
-
-```python
-# extraction/extractors/playlists.py
-from .base import BaseExtractor
-from datetime import datetime
-
-class PlaylistsExtractor(BaseExtractor):
-    def extract(self) -> dict:
-        results = {"playlists": [], "extracted_at": datetime.utcnow().isoformat()}
-        playlists = []
-
-        response = self.client.current_user_playlists(limit=50)
-        while response:
-            playlists.extend(response["items"])
-            response = self.client.next(response) if response["next"] else None
-
-        for pl in playlists:
-            tracks = []
-            track_page = self.client.playlist_tracks(pl["id"], limit=100)
-            while track_page:
-                tracks.extend(track_page["items"])
-                track_page = self.client.next(track_page) if track_page["next"] else None
-            pl["tracks_full"] = tracks
-
-        results["playlists"] = playlists
-        return results
-```
-
-### S3 loader
-
-```python
-# extraction/loaders/s3_loader.py
-import json
-import boto3
-from datetime import date
-
-class S3Loader:
-    def __init__(self, bucket: str):
-        self.bucket = bucket
-        self.s3 = boto3.client("s3")
-
-    def land(self, endpoint: str, data: dict, run_date: date | None = None) -> str:
-        run_date = run_date or date.today()
-        key = f"raw/spotify/{endpoint}/{run_date.isoformat()}/response.json"
-        self.s3.put_object(
-            Bucket=self.bucket,
-            Key=key,
-            Body=json.dumps(data, default=str),
-            ContentType="application/json",
-        )
-        return f"s3://{self.bucket}/{key}"
-```
-
-### RDS loader (upsert)
-
-```python
-# extraction/loaders/rds_loader.py
-import psycopg2
-from psycopg2.extras import execute_values
-
-class RDSLoader:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
-
-    def upsert(self, table: str, rows: list[dict], conflict_key: str) -> int:
-        if not rows:
-            return 0
-        conn = psycopg2.connect(self.dsn)
-        cols = list(rows[0].keys())
-        values = [[r[c] for c in cols] for r in rows]
-        update_cols = [c for c in cols if c != conflict_key]
-        update_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
-
-        sql = f"""
-            INSERT INTO {table} ({', '.join(cols)})
-            VALUES %s
-            ON CONFLICT ({conflict_key}) DO UPDATE SET {update_clause}
-        """
-        with conn:
-            with conn.cursor() as cur:
-                execute_values(cur, sql, values)
-        conn.close()
-        return len(rows)
-```
+The pipeline produces four analyst-ready mart tables that answer real questions about
+personal listening habits, and can be demoed live to an interviewer in under two minutes
+using real personal data.
 
 ---
 
-## Airflow DAGs
+## User Stories
 
-### Slack failure callback
+### Infrastructure
 
-```python
-# airflow/plugins/callbacks/slack_callback.py
-import os
-import requests
+1. As a data engineer, I want all AWS resources provisioned by Terraform, so that the entire
+   environment can be recreated from scratch with a single command and reviewers can inspect
+   the infrastructure as code.
 
-def slack_failure_callback(context):
-    dag_id = context["dag"].dag_id
-    task_id = context["task_instance"].task_id
-    run_id = context["run_id"]
-    log_url = context["task_instance"].log_url
+2. As a data engineer, I want infrastructure state stored in a remote S3 backend, so that
+   Terraform state is not lost if my local machine is unavailable.
 
-    requests.post(
-        os.environ["SLACK_WEBHOOK_URL"],
-        json={
-            "text": f":red_circle: *{dag_id}.{task_id}* failed\nRun: `{run_id}`\n<{log_url}|View logs>"
-        },
-    )
-```
+3. As a data engineer, I want the RDS instance isolated in a private subnet, so that the
+   database is never directly reachable from the public internet.
 
-### EL DAG
+4. As a data engineer, I want SSH access to the EC2 instance restricted to my IP address only,
+   so that the Airflow host is not exposed to the public internet.
 
-```python
-# airflow/dags/spotify_el_dag.py
-from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.operators.python import PythonOperator
-from callbacks.slack_callback import slack_failure_callback
+5. As a data engineer, I want the EC2 instance to access S3 and RDS via an IAM instance role,
+   so that no AWS credentials are stored in code or on disk.
 
-DEFAULT_ARGS = {
-    "owner": "de",
-    "retries": 2,
-    "retry_delay": timedelta(minutes=5),
-    "on_failure_callback": slack_failure_callback,
-}
+6. As a data engineer, I want Terraform to output the EC2 public IP, RDS endpoint, and S3
+   bucket name after apply, so that I can configure dependent services without manually
+   looking up resource values in the AWS console.
 
-with DAG(
-    dag_id="spotify_el",
-    schedule="0 0 * * *",      # daily midnight UTC
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    default_args=DEFAULT_ARGS,
-    tags=["spotify", "extract", "load"],
-) as dag:
+### Spotify Authentication
 
-    def extract_saved_tracks(**context):
-        # TODO: implement — call SavedTracksExtractor, land to S3
-        pass
+7. As a data engineer, I want to authenticate with the Spotify Web API using the Authorization
+   Code Flow, so that I can access personal library endpoints that require user consent.
 
-    def extract_saved_albums(**context):
-        # TODO: implement — call SavedAlbumsExtractor, land to S3
-        pass
+8. As a data engineer, I want the OAuth token to be cached to disk and auto-refreshed, so that
+   the pipeline can run headlessly on EC2 without requiring a browser interaction on each run.
 
-    def extract_playlists(**context):
-        # TODO: implement — call PlaylistsExtractor, land to S3
-        pass
+9. As a data engineer, I want credentials stored in environment variables and never in code,
+   so that the repository can be made public without leaking secrets.
 
-    def load_to_rds(**context):
-        # TODO: implement — read from S3, upsert into RDS staging tables
-        pass
+10. As a data engineer, I want to request only the minimum OAuth scopes needed, so that the
+    application follows the principle of least privilege.
 
-    t_tracks  = PythonOperator(task_id="extract_saved_tracks",  python_callable=extract_saved_tracks)
-    t_albums  = PythonOperator(task_id="extract_saved_albums",  python_callable=extract_saved_albums)
-    t_playlists = PythonOperator(task_id="extract_playlists",   python_callable=extract_playlists)
-    t_load    = PythonOperator(task_id="load_to_rds",           python_callable=load_to_rds)
+### Extraction
 
-    [t_tracks, t_albums, t_playlists] >> t_load
-```
+11. As a data engineer, I want saved tracks extracted using a watermark on `added_at`, so that
+    each run only fetches records newer than the last successful extraction.
 
-### Transform DAG
+12. As a data engineer, I want saved albums extracted using the same watermark pattern as saved
+    tracks, so that both endpoints benefit from efficient incremental loading.
 
-```python
-# airflow/dags/spotify_transform_dag.py
-from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.operators.bash import BashOperator
-from airflow.sensors.external_task import ExternalTaskSensor
-from callbacks.slack_callback import slack_failure_callback
+13. As a data engineer, I want playlists and their tracks extracted with a full refresh on every
+    run, so that tracks removed from a playlist are correctly reflected in the pipeline.
 
-DEFAULT_ARGS = {
-    "owner": "ae",
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5),
-    "on_failure_callback": slack_failure_callback,
-}
+14. As a data engineer, I want artist metadata fetched in batches of 50 IDs per API call, so
+    that the extraction respects Spotify's batch endpoint limits and minimises rate-limit risk.
 
-with DAG(
-    dag_id="spotify_transform",
-    schedule="0 0 * * *",
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    default_args=DEFAULT_ARGS,
-    tags=["spotify", "dbt", "transform"],
-) as dag:
+15. As a data engineer, I want all three extraction tasks in the EL DAG to run in parallel, so
+    that the total extraction time is bounded by the slowest endpoint, not their sum.
 
-    wait_for_el = ExternalTaskSensor(
-        task_id="wait_for_el_dag",
-        external_dag_id="spotify_el",
-        external_task_id="load_to_rds",
-        timeout=3600,
-        poke_interval=60,
-    )
+16. As a data engineer, I want paginated responses handled automatically inside each extractor,
+    so that no records are silently dropped when a library exceeds 50 items.
 
-    run_dbt = BashOperator(
-        task_id="run_dbt",
-        bash_command="cd /opt/dbt/spotify && dbt run --profiles-dir /opt/dbt",
-    )
+### Raw Landing Layer
 
-    test_dbt = BashOperator(
-        task_id="test_dbt",
-        bash_command="cd /opt/dbt/spotify && dbt test --profiles-dir /opt/dbt",
-    )
+17. As a data engineer, I want every raw API response landed to S3 as a JSON file before any
+    transformation occurs, so that the original data is preserved and can be reprocessed if
+    transformation logic changes.
 
-    wait_for_el >> run_dbt >> test_dbt
-```
+18. As a data engineer, I want raw files stored at a date-partitioned S3 prefix
+    (`raw/spotify/{endpoint}/YYYY-MM-DD/response.json`), so that any specific run's raw data
+    can be located and reprocessed by date.
 
----
+19. As a data engineer, I want writing the same file twice to overwrite the previous version
+    without error, so that the landing step is idempotent and reruns are safe.
 
-## dbt Layer
+20. As a data engineer, I want each raw file to include an `extracted_at` timestamp in its
+    payload, so that I can audit when each snapshot was taken independently of the file's
+    S3 modification time.
 
-### Project structure
+### Loading to RDS
 
-```
-dbt/
-├── dbt_project.yml
-├── profiles.yml.example
-├── models/
-│   ├── staging/
-│   │   ├── sources.yml           # declares raw RDS tables as sources
-│   │   ├── stg_saved_tracks.sql
-│   │   ├── stg_saved_albums.sql
-│   │   ├── stg_playlists.sql
-│   │   ├── stg_playlist_tracks.sql
-│   │   └── stg_artists.sql
-│   ├── intermediate/
-│   │   ├── int_tracks_with_artists.sql
-│   │   └── int_playlist_tracks_enriched.sql
-│   └── marts/
-│       ├── mart_artist_loyalty.sql
-│       ├── mart_genre_breakdown.sql
-│       ├── mart_save_velocity.sql
-│       └── mart_playlist_composition.sql
-└── tests/
-    └── assert_no_duplicate_track_ids.sql
-```
+21. As a data engineer, I want all loading to RDS performed with an upsert
+    (`INSERT ... ON CONFLICT DO UPDATE`), so that running the load step twice on the same
+    data produces no duplicate rows.
 
-### Staging model pattern
+22. As a data engineer, I want watermark state stored in a dedicated `pipeline_watermarks`
+    table in RDS, so that each incremental run knows exactly where the previous run left off.
 
-```sql
--- dbt/models/staging/stg_saved_tracks.sql
-with source as (
-    select * from {{ source('spotify_raw', 'raw_saved_tracks') }}
-),
+23. As a data engineer, I want all RDS writes wrapped in a transaction, so that a crash
+    mid-load leaves the table in its previous consistent state rather than a partial one.
 
-renamed as (
-    select
-        track_id,
-        track_name,
-        artist_id,
-        album_id,
-        added_at::timestamp             as added_at,
-        duration_ms,
-        explicit,
-        popularity,
-        _loaded_at
-    from source
-)
+24. As a data engineer, I want artist metadata loaded after saved tracks and albums, so that
+    all artist IDs referenced in those tables are available for the batch artist lookup.
 
-select * from renamed
-```
+### Orchestration
 
-### Intermediate model pattern
+25. As a data engineer, I want the EL DAG to run on a daily schedule at midnight UTC, so that
+    mart tables are refreshed with each new day's saves by the time I check them in the morning.
 
-```sql
--- dbt/models/intermediate/int_tracks_with_artists.sql
-with tracks as (
-    select * from {{ ref('stg_saved_tracks') }}
-),
+26. As a data engineer, I want the transform DAG to wait for the EL DAG's load step to
+    succeed before running dbt, so that dbt never runs against a partially-loaded dataset.
 
-artists as (
-    select * from {{ ref('stg_artists') }}
-)
+27. As a data engineer, I want failed tasks to retry automatically with a delay, so that
+    transient errors (network timeouts, API rate limits) resolve without manual intervention.
 
-select
-    t.track_id,
-    t.track_name,
-    t.added_at,
-    t.popularity,
-    a.artist_id,
-    a.artist_name,
-    a.genres
-from tracks t
-left join artists a using (artist_id)
-```
+28. As a data engineer, I want `catchup=False` on both DAGs, so that unpausing a DAG does not
+    trigger a backfill of every missed run since `start_date`.
 
-### Mart scaffolds
+29. As a data engineer, I want both DAGs tagged clearly, so that they are easy to filter in
+    the Airflow UI when the DAG list grows.
 
-```sql
--- dbt/models/marts/mart_artist_loyalty.sql
--- Question: Which artists appear most in saved tracks, by month?
-with base as (
-    select * from {{ ref('int_tracks_with_artists') }}
-)
+### Failure Alerting
 
-select
-    date_trunc('month', added_at)   as month,
-    artist_id,
-    artist_name,
-    count(*)                        as track_count,
-    min(added_at)                   as first_saved_at
-from base
-group by 1, 2, 3
-order by 1 desc, 4 desc
-```
+30. As a data engineer, I want a Slack message sent automatically whenever any task fails, so
+    that I am notified without having to monitor the Airflow UI continuously.
 
-```sql
--- dbt/models/marts/mart_genre_breakdown.sql
--- Question: Top genres in library by track count?
-with exploded as (
-    select
-        track_id,
-        added_at,
-        unnest(string_to_array(genres, ',')) as genre
-    from {{ ref('int_tracks_with_artists') }}
-    where genres is not null
-)
+31. As a data engineer, I want the Slack alert to include the DAG name, task name, run ID, and
+    a direct link to the task log, so that I can diagnose the failure from the notification
+    without logging into the Airflow UI first.
 
-select
-    trim(genre)         as genre,
-    count(*)            as track_count,
-    min(added_at)       as first_appearance
-from exploded
-group by 1
-order by 2 desc
-```
+### dbt Transformation
 
-```sql
--- dbt/models/marts/mart_save_velocity.sql
--- Question: How many tracks/albums saved per week and month?
-with tracks as (
-    select added_at, 'track' as content_type from {{ ref('stg_saved_tracks') }}
-),
-albums as (
-    select added_at, 'album' as content_type from {{ ref('stg_saved_albums') }}
-),
-combined as (
-    select * from tracks
-    union all
-    select * from albums
-)
+32. As a data engineer, I want all staging models to be views over a single source table each,
+    so that they stay fresh automatically and do not duplicate storage.
 
-select
-    date_trunc('week',  added_at)   as week,
-    date_trunc('month', added_at)   as month,
-    content_type,
-    count(*)                        as saves
-from combined
-group by 1, 2, 3
-order by 1 desc
-```
+33. As a data engineer, I want intermediate models materialized as ephemeral CTEs, so that
+    join logic is reusable across mart models without creating intermediate tables in the
+    database.
 
-```sql
--- dbt/models/marts/mart_playlist_composition.sql
--- Question: Which artists and genres dominate each playlist?
-with base as (
-    select * from {{ ref('int_playlist_tracks_enriched') }}
-)
+34. As a data engineer, I want all mart models materialized as tables, so that analyst queries
+    against the marts are fast regardless of the complexity of the upstream SQL.
 
-select
-    playlist_id,
-    playlist_name,
-    artist_id,
-    artist_name,
-    count(*)            as track_count,
-    array_agg(distinct genre) filter (where genre is not null) as genres
-from base
-group by 1, 2, 3, 4
-order by 1, 5 desc
-```
+35. As a data engineer, I want all dbt models to reference sources and upstream models with
+    `{{ source() }}` and `{{ ref() }}`, so that dbt can enforce the correct build order and
+    generate an accurate lineage graph.
+
+36. As a data engineer, I want `dbt test` to run after `dbt run` in the transform DAG, so that
+    a data quality failure causes the DAG task to fail and triggers the Slack alert.
+
+### Mart Tables
+
+37. As a data analyst, I want a mart table showing my most-saved artists broken down by month,
+    so that I can identify which artists I was most engaged with during specific time periods.
+
+38. As a data analyst, I want a mart table showing the top genres in my library ranked by track
+    count, so that I can understand the overall shape of my musical taste.
+
+39. As a data analyst, I want a mart table showing how many tracks and albums I saved per week
+    and per month over time, so that I can see whether my library is growing faster or slower
+    across different periods.
+
+40. As a data analyst, I want a mart table showing which artists and genres dominate each of my
+    playlists, so that I can understand the character of each playlist beyond just its name.
+
+41. As a data analyst, I want genre data derived from artist metadata rather than track metadata,
+    so that genres are consistent (Spotify assigns genres to artists, not individual tracks).
+
+### Data Quality
+
+42. As a data engineer, I want `not_null` and `unique` tests on every primary key column in
+    every staging model, so that data integrity violations are caught before they corrupt mart
+    tables.
+
+43. As a data engineer, I want the `pipeline_watermarks` table updated only after a successful
+    load, so that a failed run does not advance the watermark and cause records to be skipped
+    on the next run.
 
 ---
 
-## PostgreSQL Schema
+## Implementation Decisions
 
-```sql
--- Raw staging tables (loaded by Python)
-create table if not exists raw_saved_tracks (
-    track_id        text primary key,
-    track_name      text,
-    artist_id       text,
-    album_id        text,
-    added_at        text,
-    duration_ms     int,
-    explicit        boolean,
-    popularity      int,
-    _loaded_at      timestamp default now()
-);
+### Modules
 
-create table if not exists raw_saved_albums (
-    album_id        text primary key,
-    album_name      text,
-    artist_id       text,
-    added_at        text,
-    total_tracks    int,
-    _loaded_at      timestamp default now()
-);
+**SpotifyAuthenticator**
+Wraps `SpotifyOAuth` configuration behind a single factory function. Reads credentials from
+environment variables. Manages the token cache path. Returns a ready-to-use Spotipy client.
+This is the only module that touches OAuth — all extractors receive a client, never credentials.
 
-create table if not exists raw_playlists (
-    playlist_id     text primary key,
-    playlist_name   text,
-    owner_id        text,
-    _loaded_at      timestamp default now()
-);
+**WatermarkStore**
+Encapsulates all reads and writes to the `pipeline_watermarks` table. Exposes two operations:
+read the last watermark for an endpoint, and write a new watermark after a successful load.
+Hiding this behind its own interface means the watermark storage mechanism can change
+(e.g. move to AWS SSM Parameter Store) without touching any extractor.
 
-create table if not exists raw_playlist_tracks (
-    playlist_id     text,
-    track_id        text,
-    added_at        text,
-    position        int,
-    _loaded_at      timestamp default now(),
-    primary key (playlist_id, track_id)
-);
+**BaseExtractor + concrete extractors (SavedTracks, SavedAlbums, Playlists, ArtistMetadata)**
+Each extractor inherits from a common base that enforces the `extract(**kwargs) -> dict`
+contract. Pagination is handled entirely inside the extractor — callers never see the
+Spotify pagination model. The watermark parameter is optional; extractors that do full
+refreshes (Playlists) ignore it.
 
-create table if not exists raw_artists (
-    artist_id       text primary key,
-    artist_name     text,
-    genres          text,   -- comma-separated, unnested in dbt
-    popularity      int,
-    followers       int,
-    _loaded_at      timestamp default now()
-);
+**S3Loader**
+Accepts a bucket name at construction. Exposes a single `land(endpoint, data, run_date)`
+method that constructs the date-partitioned key and writes JSON. All S3 interaction is
+contained here — no other module imports boto3.
 
--- Watermark table (used by incremental extractors)
-create table if not exists pipeline_watermarks (
-    endpoint        text primary key,
-    last_extracted  timestamp not null,
-    updated_at      timestamp default now()
-);
-```
+**RDSLoader**
+Accepts a DSN string at construction. Exposes a single `upsert(table, rows, conflict_key)`
+method that generates the `INSERT ... ON CONFLICT` SQL dynamically from the row shape.
+All psycopg2 interaction is contained here — no other module opens database connections.
+
+**EL DAG**
+Four tasks: three parallel extraction tasks (one per primary endpoint) and one load task
+that depends on all three. The load task also triggers artist metadata extraction using
+IDs collected from the just-loaded track and album tables.
+
+**Transform DAG**
+Three tasks: an `ExternalTaskSensor` that blocks until the EL DAG's load step succeeds,
+a `BashOperator` that runs `dbt run`, and a `BashOperator` that runs `dbt test`.
+
+**SlackFailureCallback**
+A standalone function passed as `on_failure_callback` in both DAGs' `default_args`.
+Reads the webhook URL from an environment variable and POSTs a structured message using
+the Airflow task context.
+
+**dbt staging layer**
+One model per source table. Each model renames columns to a consistent convention and
+casts `added_at` from text to timestamp. No joins, no aggregations.
+
+**dbt intermediate layer**
+Two models: one that enriches tracks with their artist metadata, one that enriches
+playlist track membership with playlist and track/artist detail. Both are ephemeral.
+
+**dbt mart layer**
+Four models, each answering one analytical question (see User Stories 37–40). Each mart
+reads from intermediate models only — never directly from staging or sources.
+
+**Terraform modules**
+Five focused modules: networking (VPC, subnets, routing), compute (EC2, security group,
+key pair), database (RDS, subnet group, security group), storage (S3 bucket), iam
+(instance role and policy). Modules are wired together in `main.tf`; cross-module
+dependencies are passed as outputs.
+
+### Architectural Decisions
+
+- Self-hosted Airflow on EC2 over MWAA — cost: MWAA minimum ~$300/month vs ~$30/month
+  for a `t3.medium`. See ADR 0001.
+- RDS PostgreSQL over Redshift — personal Spotify data volume does not justify a columnar
+  warehouse; PostgreSQL's `unnest` and `string_to_array` functions handle genre expansion
+  natively.
+- Hybrid incremental strategy — watermark for saved tracks and albums (append-only),
+  full refresh + upsert for playlists (membership can decrease).
+- Two DAGs over one — clean separation of EL ownership (data engineer) from transform
+  ownership (analytics engineer); the `ExternalTaskSensor` is the explicit contract
+  between them.
+- Genres stored as comma-separated text in RDS, unnested in dbt — avoids a separate
+  `artist_genres` junction table while keeping the raw layer faithful to the API response.
+
+### Schema
+
+Five raw tables loaded by Python: `raw_saved_tracks`, `raw_saved_albums`, `raw_playlists`,
+`raw_playlist_tracks`, `raw_artists`. One control table: `pipeline_watermarks`.
+All primary keys are Spotify string IDs. `added_at` stored as text in raw tables and cast
+to timestamp in staging models.
 
 ---
 
-## Milestones
+## Testing Decisions
 
-| # | Milestone | Deliverable |
-|---|-----------|-------------|
-| 1 | **Infra up** | Terraform provisions EC2 + RDS + S3. SSH into EC2 confirmed. |
-| 2 | **Airflow running** | Docker Compose on EC2. Both DAGs visible in UI, no import errors. |
-| 3 | **Spotify auth working** | OAuth flow completes, token cached. `GET /me/tracks` returns data. |
-| 4 | **Extraction + S3 landing** | All extractors run, raw JSON lands in S3 with correct prefix structure. |
-| 5 | **RDS loaded** | All raw tables populated. Upsert idempotency verified by running twice. |
-| 6 | **dbt staging + intermediate** | `dbt run` succeeds on staging + intermediate models. `dbt test` passes. |
-| 7 | **Mart tables** | All four marts build successfully and return non-empty results. |
-| 8 | **End-to-end scheduled run** | Both DAGs run automatically at midnight, Slack fires on injected failure. |
-| 9 | **Audio features (stretch)** | Verify `/audio-features` access. Add extractor + staging model + mart if available. |
+**What makes a good test here**
+Test observable outputs given controlled inputs — not the internal steps taken to produce them.
+For an extractor, the observable output is the shape and content of the dict it returns.
+For a loader, the observable output is the database or S3 state after the call.
+Do not assert on which internal methods were called; assert on what changed in the world.
+
+**Modules to test**
+
+*WatermarkStore* — unit tests with a real test database (not mocked). Assert that reading
+from an empty table returns None, that writing a watermark persists correctly, and that a
+second write updates rather than duplicates. These tests are fast and the real SQL
+behaviour matters.
+
+*RDSLoader.upsert* — integration test with a real test database. Seed a table, call upsert
+with overlapping rows, assert row counts and updated values. A mock here would not catch
+the actual ON CONFLICT SQL behaviour.
+
+*SavedTracksExtractor / SavedAlbumsExtractor* — unit tests with a mocked Spotipy client.
+Return a controlled paginated response from the mock. Assert that all pages are collected,
+that the watermark filter drops the correct items, and that `extracted_at` is present in
+the output. Mocking is appropriate here because the Spotify API is external.
+
+*PlaylistsExtractor* — unit tests with mocked client. Assert that nested track pagination
+is followed and that tracks are attached to the correct playlist in the output.
+
+*S3Loader* — unit tests with mocked boto3. Assert that `put_object` is called with the
+correct key for a given endpoint and date, and that the body is valid JSON.
+
+*SlackFailureCallback* — unit test with mocked `requests.post`. Assert that the correct
+URL and message shape are sent for a given Airflow context dict.
+
+*dbt models* — use dbt's built-in test framework. `not_null` and `unique` on all primary
+key columns in staging models. Row-count assertion tests on mart models once data is loaded
+(assert each mart returns at least one row).
+
+**Modules not tested**
+
+`SpotifyAuthenticator` — OAuth browser redirect cannot be unit tested meaningfully. Tested
+manually during Milestone 3.
+
+Terraform modules — infrastructure correctness verified by `terraform plan` output and
+post-apply smoke tests (SSH in, confirm RDS reachable from EC2).
+
+Airflow DAG structure — `python dag_file.py` import test catches syntax and import errors.
+Full DAG execution tested by manual trigger in Milestone 5 and 7.
 
 ---
 
-## Open Questions
+## Out of Scope
 
-- [ ] Verify `/audio-features/{id}` endpoint accessibility with new developer app
-- [ ] Confirm Spotify OAuth token refresh works in headless EC2 environment (first auth requires browser; consider running initial auth locally and copying token cache to EC2)
-- [ ] Decide on EC2 key pair management (AWS-generated vs. locally generated)
+- **Audio features** (`/audio-features/{id}`) — endpoint availability unverified for new
+  developer apps as of late 2024. Architecture is designed to add this as a single new
+  extractor + staging model if the endpoint is accessible. Tracked as Milestone 9 stretch goal.
+- **Recently played / top tracks / top artists** — restricted by Spotify for new apps.
+- **Dashboard or visualisation layer** — mart tables are the output. Connecting a BI tool
+  (Metabase, Grafana, Superset) is a separate project.
+- **Multi-user support** — pipeline is scoped to a single Spotify account. The OAuth token
+  cache is a single file; no multi-tenancy is designed.
+- **Backfilling historical data** — `catchup=False` on both DAGs. Historical data is loaded
+  on the first full run (no watermark). Scheduled reruns are incremental only.
+- **MWAA or managed Airflow** — evaluated and excluded on cost grounds (ADR 0001).
+- **dbt Cloud** — dbt Core on EC2 is sufficient; dbt Cloud adds cost and an external
+  dependency without benefit at this scale.
+- **CI/CD pipeline** — no automated deployment on push. Deployment is manual via SSH.
+
+---
+
+## Further Notes
+
+**OAuth headless deployment**
+The Spotify Authorization Code Flow requires a browser redirect on first auth. This must be
+run locally. The resulting token cache file is then copied to EC2 via `scp`. Every
+subsequent run uses the refresh token silently. This is a known constraint of personal-data
+OAuth flows in headless environments and should be documented in the README.
+
+**Interview demo path**
+The four mart tables can be queried live in a psql session or a simple SQL client.
+Prepared queries for each mart make it easy to show real results in under two minutes
+without requiring a dashboard. Keep these queries in a `demo/` directory.
+
+**Spotify endpoint verification**
+Before implementing the audio features extractor (Milestone 9), verify access by calling
+`GET /audio-features/{id}` with a valid track ID using the developer app. A 403 response
+means the endpoint is restricted for new apps. A 200 means it is available and the
+stretch goal is unblocked.
+
+**Cost estimate**
+Running continuously: EC2 `t3.medium` ~$30/month + RDS `db.t3.micro` ~$15/month +
+S3 (negligible for this data volume) = ~$45/month. Stop the EC2 instance when not
+actively developing to reduce cost.
